@@ -14,6 +14,129 @@
 
 ---
 
+## 🧩 本 fork 改動紀錄（Durable Object 排程版）
+
+> 本節為繁體中文，其餘章節沿用上游簡體原文。
+
+線上部署：`https://workbuddy-trae-checkin.ogeypt.workers.dev`（Cloudflare Workers Free 方案）
+
+### 1. 為什麼要改：Cron Trigger 名額已滿
+
+Workers Free 方案每個帳號只有 **5 個 Cron Trigger**，本帳號已被其他 Worker 用滿，`wrangler deploy` 掛 cron 時直接失敗：
+
+```
+This account has reached the Workers Free limit of 5 cron triggers per account.
+Upgrade to Workers Paid to increase this limit to 1,000. [code: 10072]
+```
+
+因此**完全不使用 Cron Trigger**，改用 Durable Object 的 **alarm 自我排程**：不佔 Cron 名額、不需要外部定時器、不需要付費方案。
+
+### 2. 排程機制
+
+| 項目 | 內容 |
+|---|---|
+| 觸發器 | `SchedulerAlarm`（Durable Object，SQLite backend） |
+| 台北時間 | **08:10、10:20** 各跑一輪（第二輪專門補 Qoder，另兩家當天已簽會自動跳過） |
+| UTC 時間 | `00:10`、`02:20`（Cloudflare 只認 UTC，台北 = UTC+8） |
+| 續排方式 | `alarm()` 跑完在 `finally` 續排下一個時段；失敗也照樣續排，不會斷鏈 |
+| 鏈條修復 | 任何請求進來都會冪等補掛 alarm（`storage.getAlarm() === null` 才設），DO 被驅逐後自動接回 |
+| 失敗重試 | 未捕捉例外由平台以指數退避重試（2 秒起、最多 6 次）；本專案另在 `alarm()` 內 try/catch 並把錯誤寫入 `lastError` |
+| 原始 Cron | 保留 `scheduled` handler，日後升級付費方案時把 `[triggers] crons` 加回即可無痛切換 |
+
+### 3. 綁定一覽
+
+| 類型 | 名稱 | 說明 |
+|---|---|---|
+| KV Namespace | `KV` | 三個平台共用，資料以 `trae:` / `wb:` / `qoder:` 前綴隔離 |
+| Secret | `MASTER_KEY` | 32 bytes base64（44 字元、`=` 結尾），加密 KV 內所有令牌 |
+| Secret | `ADMIN_TOKEN` | 後台登入密碼（`X-Admin-Token`） |
+| Secret | `CRON_SECRET` | 選配；`/cron` 對外觸發用，未設則回退 `ADMIN_TOKEN` |
+| Durable Object | `SCHEDULER` → `SchedulerAlarm` | 排程用，`new_sqlite_classes`（Free 方案僅支援 SQLite backend） |
+| 環境變數 | `PUBLIC_ORIGIN` | `https://<你的-worker>.workers.dev`，alarm 內組內部請求用 |
+
+> ⚠️ 本倉庫**不含任何密鑰**。`MASTER_KEY` / `ADMIN_TOKEN` / `CRON_SECRET` 只用 `wrangler secret put` 寫進 Cloudflare，不進版控。
+
+### 4. 用 wrangler 部署
+
+```bash
+git clone https://github.com/HPCstan/workbuddy-trae-checkin.git
+cd workbuddy-trae-checkin
+
+# 1) 建 KV，把回傳的 id 填進 wrangler.toml 的 [[kv_namespaces]]
+npx wrangler kv namespace create workbuddy-trae-checkin-kv
+
+# 2) 部署（DO binding 會依 wrangler.toml 自動建立）
+npx wrangler deploy
+
+# 3) 設定 secrets（值由你自己產生，勿寫進檔案）
+#    MASTER_KEY 產生方式：node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+npx wrangler secret put MASTER_KEY
+npx wrangler secret put ADMIN_TOKEN
+npx wrangler secret put CRON_SECRET   # 選配
+```
+
+部署成功會顯示：
+
+```
+env.SCHEDULER (SchedulerAlarm)   Durable Object
+env.KV (...)                     KV Namespace
+env.PUBLIC_ORIGIN (...)           Environment Variable
+https://workbuddy-trae-checkin.<你的子域>.workers.dev
+```
+
+### 5. 排程維運 API
+
+| 端點 | 方法 | 認證 | 用途 |
+|---|---|---|---|
+| `/api/scheduler` | GET | `X-Admin-Token` | 查目前 `alarmAt`、`lastRun`、`lastError` |
+| `/api/scheduler/fire` | POST | `X-Admin-Token` | 讓 alarm **3 秒後**跑一次（驗證排程鏈；簽到本身冪等，不會重複加分） |
+| `/cron` | POST | `X-Cron-Secret` | 外部定時器備援入口（VPS / cron-job.org 等） |
+
+查狀態：
+
+```bash
+curl -s https://<你的-worker>.workers.dev/api/scheduler \
+  -H "X-Admin-Token: <ADMIN_TOKEN>"
+```
+
+```json
+{
+  "alarm": 1795306200000,
+  "alarmAt": "2026-11-22T00:10:00.000Z",
+  "lastRun": {
+    "at": "2026-11-21T10:21:47.225Z",
+    "retryCount": 0,
+    "at8": "2026-11-21T18:21:47.569 +08:00",
+    "trae": 0,
+    "wb": 0,
+    "qoder": 0
+  },
+  "lastError": null
+}
+```
+
+`lastRun` 是最近一次 alarm 的執行摘要（`trae` / `wb` 為 checked 數、`qoder` 為帳號數）；`lastError` 只有在 `alarm()` 拋錯時才有值，正常為 `null`。
+
+### 6. 免費額度估算
+
+DO 免費方案每日額度：Requests 100,000、Duration 13,000 GB-s、SQL rows read 5,000,000、SQL rows written 100,000。
+
+本專案每天 2 輪、每輪約 6 次 storage 寫入，加上頁面瀏覽的補掛請求（每次 1 request + 1 row read），實際用量約 **每天 12 rows written / 數十 requests**，與額度相差好幾個數量級。
+
+### 7. 注意事項
+
+- **DO class 名稱與 migration tag 一旦上線就不要改**；改名或刪除前必須先清空該 class 的 DO。
+- 每個 DO **同時只能有 1 個 alarm**，所以兩輪排程是「跑完算下一輪」的單一鏈條，不是兩個獨立排程。
+- alarm 是 **at-least-once、不保證秒級準時**（時間到之後才跑），簽到介面冪等，不受影響。
+- Workers Free 每次 invocation 的 **CPU 上限 10 ms**（等待 `fetch` 不計）；帳號數量極大時建議拆成更多輪次。
+- `wrangler.toml` 已註解說明排程來源；若日後升級 Workers Paid，加回：
+  ```toml
+  [triggers]
+  crons = ["10 0 * * *", "20 2 * * *"]
+  ```
+
+---
+
 ## 一、部署
 
 全程在 Cloudflare 网页控制台完成，不用装工具、不用命令行。

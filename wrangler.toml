@@ -1,0 +1,21 @@
+name = "workbuddy-trae-checkin"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "KV"
+id = "f942bc056ad94e7c9c9c83fa213428c1"
+
+# 排程改用 Durable Object alarm（Workers Free 每帳號 5 個 Cron Trigger 已用滿）
+# Free 方案只能用 SQLite 後端的 DO，所以用 new_sqlite_classes
+[[durable_objects.bindings]]
+name = "SCHEDULER"
+class_name = "SchedulerAlarm"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SchedulerAlarm"]
+
+[vars]
+PUBLIC_ORIGIN = "https://workbuddy-trae-checkin.ogeypt.workers.dev"

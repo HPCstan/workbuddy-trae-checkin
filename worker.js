@@ -4687,6 +4687,9 @@ export default {
     const path = url.pathname.replace(/\/+$/, '') || '/';
     const method = request.method.toUpperCase();
 
+    // 排程靠 Durable Object alarm（Free 方案 Cron 名額已滿），每次請求順手冪等補掛
+    ctx.waitUntil(armScheduler(env));
+
     try {
       if (path === '/' || path === '/index.html') return htmlResponse(PAGE);
 
@@ -4705,6 +4708,20 @@ export default {
       if (path === '/api/ping' && method === 'GET') {
         const a = requireAdmin(request, env);
         return a.ok ? json({ ok: true }) : a.res;
+      }
+
+      // 排程狀態：目前 alarm 時間 + 上次執行結果 / 錯誤
+      if (path === '/api/scheduler' && method === 'GET') {
+        const a = requireAdmin(request, env);
+        if (!a.ok) return a.res;
+        return await env.SCHEDULER.get(env.SCHEDULER.idFromName('daily')).fetch('https://scheduler.internal/state');
+      }
+
+      // 手動讓 alarm 在 3 秒後跑一次（驗證排程鏈用，簽到本身冪等）
+      if (path === '/api/scheduler/fire' && method === 'POST') {
+        const a = requireAdmin(request, env);
+        if (!a.ok) return a.res;
+        return await env.SCHEDULER.get(env.SCHEDULER.idFromName('daily')).fetch('https://scheduler.internal/fire');
       }
 
       if (path === '/api/run-all' && method === 'POST') {
@@ -4819,3 +4836,96 @@ export default {
     );
   },
 };
+
+/* ------------------------------------------------------------------ */
+/* 定时排程：Durable Object alarm                                      */
+/*                                                                     */
+/* Workers Free 每個帳號最多 5 個 Cron Trigger，本帳號已用滿（error 10072）， */
+/* 因此改由 DO 的 alarm 自我排程，不佔 Cron 名額。                      */
+/* ------------------------------------------------------------------ */
+
+const DEFAULT_ORIGIN = 'https://workbuddy-trae-checkin.ogeypt.workers.dev';
+
+// 台北 08:10 / 10:20 各跑一輪（Cloudflare 只認 UTC，台北 = UTC+8）
+const CHECKIN_SLOTS_UTC = [[0, 10], [2, 20]];
+
+/** 下一個簽到時間點（UTC 毫秒），留 60 秒餘量避免同一時段重複觸發 */
+function nextCheckinSlot(nowMs) {
+  const d = new Date(nowMs);
+  for (let day = 0; day <= 1; day++) {
+    for (const [h, m] of CHECKIN_SLOTS_UTC) {
+      const t = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + day, h, m, 0, 0);
+      if (t > nowMs + 60e3) return t;
+    }
+  }
+  return nowMs + 24 * 3600e3;
+}
+
+/** 冪等補掛：已排好 alarm 就不動；alarm 鏈若中斷，下一個請求會自動接回去 */
+function armScheduler(env) {
+  if (!env || !env.SCHEDULER) return Promise.resolve();
+  try {
+    return env.SCHEDULER.get(env.SCHEDULER.idFromName('daily')).fetch('https://scheduler.internal/arm').catch(() => {});
+  } catch {
+    return Promise.resolve();
+  }
+}
+
+export class SchedulerAlarm {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  /** /arm 補掛、/state 看狀態、/fire 立即觸發一次 */
+  async fetch(request) {
+    const path = request ? new URL(request.url).pathname : '/arm';
+
+    if (path === '/fire') {
+      await this.state.storage.setAlarm(Date.now() + 3000);
+      const at = await this.state.storage.getAlarm();
+      return json({ ok: true, alarmAt: at ? new Date(at).toISOString() : null });
+    }
+
+    let alarm = await this.state.storage.getAlarm();
+    if (alarm === null) {
+      await this.state.storage.setAlarm(nextCheckinSlot(Date.now()));
+      alarm = await this.state.storage.getAlarm();
+      console.log('[scheduler] armed for', new Date(alarm || 0).toISOString());
+    }
+
+    if (path !== '/state') return json({ alarm });
+
+    return json({
+      alarm,
+      alarmAt: alarm ? new Date(alarm).toISOString() : null,
+      lastRun: (await this.state.storage.get('lastRun')) || null,
+      lastError: (await this.state.storage.get('lastError')) || null,
+    });
+  }
+
+  /** alarm 觸發：三個平台跑一輪，之後續排下一個時間點（失敗也照樣續排） */
+  async alarm(info) {
+    const startedAt = new Date().toISOString();
+    const origin = this.env.PUBLIC_ORIGIN || DEFAULT_ORIGIN;
+    try {
+      const result = await runAll(this.env, origin, false);
+      await this.state.storage.put('lastRun', {
+        at: startedAt,
+        retryCount: (info && info.retryCount) || 0,
+        at8: result.at,
+        trae: result.trae && result.trae.checked,
+        wb: result.wb && result.wb.checked,
+        qoder: result.qoder && result.qoder.count,
+      });
+      await this.state.storage.delete('lastError');
+      console.log('[scheduler] run ok', startedAt);
+    } catch (err) {
+      const message = err instanceof Error ? err.stack || err.message : String(err);
+      await this.state.storage.put('lastError', message);
+      console.error('[scheduler] run failed', message);
+    } finally {
+      await this.state.storage.setAlarm(nextCheckinSlot(Date.now()));
+    }
+  }
+}
